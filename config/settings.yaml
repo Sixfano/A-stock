@@ -1,0 +1,43 @@
+market:
+  name: A-share
+  timezone: Asia/Shanghai
+
+screen:
+  top_n:
+    one_to_two: 10
+    two_to_three: 8
+    three_to_four: 5
+    high_level: 5
+
+weights:
+  one_to_two:
+    limitup_quality: 0.20
+    sector_strength: 0.20
+    limitup_gene: 0.15
+    turnover_quality: 0.15
+    auction: 0.20
+    sentiment: 0.10
+  two_to_three:
+    leader: 0.25
+    sector_ladder: 0.15
+    divergence_to_strength: 0.15
+    auction: 0.20
+    turnover: 0.10
+    sentiment: 0.10
+    risk: 0.05
+  three_to_four:
+    leader: 0.25
+    market_height: 0.15
+    sector_diffusion: 0.15
+    turnover_structure: 0.15
+    auction: 0.10
+    sentiment: 0.10
+    acceleration_risk: 0.10
+  high_level:
+    leader_identity: 0.25
+    theme_core: 0.20
+    market_height: 0.15
+    sector_ladder: 0.10
+    sentiment: 0.15
+    auction: 0.10
+    risk: 0.05

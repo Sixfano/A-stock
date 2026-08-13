@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "a-stock-limitup-engine"
+version = "0.1.0"
+description = "Reusable A-share limit-up, momentum, sentiment and short-term research engine"
+requires-python = ">=3.10"
+dependencies = [
+  "akshare>=1.18.0",
+  "pandas>=2.0",
+  "numpy>=1.24",
+  "pyyaml>=6.0",
+  "pydantic>=2.0"
+]
