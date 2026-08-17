@@ -9,6 +9,27 @@ screen:
     three_to_four: 5
     high_level: 5
 
+# 2026-08-17 close review: keep the base weights unchanged. The additions below
+# are process guardrails and shadow factors until enough out-of-sample data exists.
+guardrails:
+  decision_windows:
+    formal_pool: "09:35"
+    delayed_weak_to_strong_review: "10:00"
+  weak_to_strong_soft_pool:
+    auction_gap_pct: [0.0, 5.0]
+    require_prior_distinctive: true
+    require_sector_ladder: true
+  scoring:
+    separate_strength_and_tradability: true
+    nonlinear_open_board_divergence: true
+    dynamic_sentiment_multipliers: shadow
+  evaluation:
+    metrics: [precision, recall, false_negative_count, tradable_success_rate]
+    minimum_trading_days_before_reweight: 5
+    target_trading_days: 10
+    minimum_candidates_before_reweight: 50
+    target_candidates: 100
+
 weights:
   one_to_two:
     limitup_quality: 0.20
