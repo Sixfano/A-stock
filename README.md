@@ -51,13 +51,13 @@
 运行当日涨停证据快照：
 
 ```bash
-python scripts/run_screen.py --date 20260819
+python -m scripts.run_screen --date 20260819
 ```
 
 保存为 CSV：
 
 ```bash
-python scripts/run_screen.py --date 20260819 --output reports/20260819_evidence.csv
+python -m scripts.run_screen --date 20260819 --output reports/20260819_evidence.csv
 ```
 
 详见 `docs/limitup_evidence_layer.md`。
@@ -77,3 +77,19 @@ python scripts/run_screen.py --date 20260819 --output reports/20260819_evidence.
 
 核心交易风格仍然是：连板身位 + 健康换手 + 板块梯队 + 龙头带动 +
 情绪周期 + 竞价预期。传统技术指标与新增数据只用于确认、反证和风险解释。
+
+## 2026-08-19 V2.1：工程收口与实战化流水线
+
+每日筛选通过 `ProviderRouter` 获取数据，并使用统一的 point-in-time 选择逻辑：目标日期 `T` 只允许使用 `trade_date <= T` 的记录；没有历史记录时标记为 `unavailable`，不会回退到未来的最新数据。候选输出明确区分 `base_strategy_score` 与 `evidence_shadow_score`，`final_score` 保持为基础策略分，不与影子分线性相加。
+
+每只候选同时输出核心入选逻辑、正向证据、反向证据/风险、板块地位、高标反馈、同身位卡位、题材回流、CYQ 筹码和次日观察重点。资金流、龙虎榜、CYQ 或其他 provider 不可用时，流水线保留剩余证据并记录 `data_quality`，不会因单个数据源失败而整体崩溃。题材回流分是未经历史校准的启发式倾向分，不代表真实概率。
+
+CLI 推荐使用模块方式：
+
+```bash
+python -m scripts.run_screen --help
+python -m scripts.run_screen --date 20260819
+python -m scripts.run_screen --date 20260819 --output reports/20260819_evidence.csv
+```
+
+GitHub Actions 会在 push 和 pull request 时用 Python 3.10 与 3.11 执行 `python -m compileall .` 和 `pytest -q`。实时 AKShare 接口不属于 CI 单元测试；若本地未安装 AKShare 或数据接口不可用，命令会明确输出 `unavailable`/`fallback` 状态，而不会伪造筛选结果。

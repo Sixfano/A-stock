@@ -1,52 +1,94 @@
-"""Daily limit-up evidence snapshot.
+"""Point-in-time daily limit-up evidence screening.
 
-This is a research snapshot, not an auto-trading command. It enriches the
-existing relay workflow with evidence and does not replace the four base scores.
+The four relay strategies remain the source of candidate eligibility. Evidence
+is shadow-only: it explains, ranks for review, and flags risk; it never replaces
+or linearly adds to a base strategy score.
 """
 from __future__ import annotations
 
 import argparse
+import logging
 from pathlib import Path
+from typing import Any
+
 import pandas as pd
 
+from data.point_in_time import select_point_in_time_row
 from data.providers.akshare_provider import AKShareProvider, market_for_code
+from data.providers.router import ProviderRouter
+from factors.competition import SameHeightCandidate, same_height_competition
 from factors.cyq import CYQSnapshot, cyq_structure_evidence
+from factors.leader_feedback import LeaderObservation, sector_high_level_feedback
+from factors.theme_reflow import theme_reflow_evidence
+from strategies.high_level import score_high_level
+from strategies.one_to_two import score_one_to_two
+from strategies.three_to_four import score_three_to_four
+from strategies.two_to_three import score_two_to_three
+
+logger = logging.getLogger(__name__)
 
 
-def _scalar(row, column, default=None):
+def _scalar(row: Any, column: str, default=None):
     if row is None or column not in row:
         return default
     value = row[column]
-    if pd.isna(value):
-        return default
-    return value
+    return default if pd.isna(value) else value
 
 
-def _latest_individual_flow(provider, code: str):
-    try:
-        flow = provider.individual_fund_flow(code, market_for_code(code))
-    except Exception:
-        return {}
-    if flow is None or flow.empty:
-        return {}
-    row = flow.iloc[-1]
+def _number(row: Any, *columns: str, default: float = 0.0) -> float:
+    for column in columns:
+        value = _scalar(row, column)
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+    return default
+
+
+def _clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
+    return max(low, min(high, float(value)))
+
+
+def _safe_call(router: ProviderRouter, method: str, *args, **kwargs) -> pd.DataFrame:
+    result = router.call(method, *args, **kwargs)
+    if not result.available or result.data is None:
+        return pd.DataFrame()
+    return result.data.copy() if hasattr(result.data, "copy") else pd.DataFrame()
+
+
+def _pit_row(frame: pd.DataFrame, target_date: str) -> tuple[pd.Series | None, str]:
+    if frame.empty:
+        return None, "unavailable"
+    date_candidates = ["日期", "交易日期", "日期时间", "时间"]
+    date_col = next((col for col in date_candidates if col in frame.columns), None)
+    if date_col is None:
+        return None, "unavailable_no_date_column"
+    result = select_point_in_time_row(frame, target_date, date_col)
+    return result.row, result.status
+
+
+def _latest_individual_flow(router: ProviderRouter, code: str, target_date: str) -> dict:
+    flow = _safe_call(router, "individual_fund_flow", code, market_for_code(code))
+    row, status = _pit_row(flow, target_date)
+    if row is None:
+        return {"资金流可用": False, "资金流状态": status}
     return {
+        "资金流可用": True,
+        "资金流状态": status,
         "主力净流入占比": _scalar(row, "主力净流入-净占比"),
         "超大单净流入占比": _scalar(row, "超大单净流入-净占比"),
         "大单净流入占比": _scalar(row, "大单净流入-净占比"),
     }
 
 
-def _latest_cyq(provider, code: str, close: float | None):
+def _latest_cyq(router: ProviderRouter, code: str, close: float | None, target_date: str) -> dict:
     if close is None or close <= 0:
-        return {}
-    try:
-        df = provider.cyq(code)
-    except Exception:
-        return {}
-    if df is None or df.empty:
-        return {}
-    row = df.iloc[-1]
+        return {"CYQ可用": False, "CYQ状态": "unavailable_no_close"}
+    cyq = _safe_call(router, "cyq", code)
+    row, status = _pit_row(cyq, target_date)
+    if row is None:
+        return {"CYQ可用": False, "CYQ状态": status}
     snap = CYQSnapshot(
         close=float(close),
         winner_ratio=_scalar(row, "获利比例"),
@@ -60,6 +102,8 @@ def _latest_cyq(provider, code: str, close: float | None):
     )
     evidence = cyq_structure_evidence(snap)
     return {
+        "CYQ可用": evidence.available,
+        "CYQ状态": status,
         "CYQ获利比例": snap.winner_ratio,
         "CYQ平均成本": snap.avg_cost,
         "CYQ90成本低": snap.cost90_low,
@@ -73,144 +117,207 @@ def _latest_cyq(provider, code: str, close: float | None):
     }
 
 
-def build_snapshot(
-    date: str,
-    enrich_top: int = 80,
-    cyq_top: int = 30,
-) -> pd.DataFrame:
-    provider = AKShareProvider()
-    pool = provider.limit_up_pool(date).copy()
+def _base_score(row: pd.Series) -> tuple[str, float]:
+    """Evaluate a base-style score from normalized pool fields only.
+
+    This is a reporting adapter; the four strategy functions and their weights
+    are untouched. Missing fields default to neutral values and are not treated
+    as evidence.
+    """
+    height = int(_number(row, "连板数", default=0))
+    common = {
+        "auction": _clamp(50 + _number(row, "竞价涨幅", "竞价金额", default=0) * 5),
+        "sentiment": 50.0,
+        "risk": _clamp(60 - _number(row, "炸板次数", default=0) * 8),
+    }
+    if height == 1:
+        features = {**common, "limitup_quality": _clamp(70), "sector_strength": 50,
+                    "limitup_gene": 50, "turnover_quality": _clamp(_number(row, "换手率", default=10) * 5)}
+        return "一进二", round(score_one_to_two(features), 2)
+    if height == 2:
+        features = {**common, "leader": 55, "sector_ladder": 50,
+                    "divergence_to_strength": 55, "turnover": _clamp(_number(row, "换手率", default=10) * 5)}
+        return "二进三", round(score_two_to_three(features), 2)
+    if height == 3:
+        features = {**common, "leader": 60, "market_height": 55,
+                    "sector_diffusion": 50, "turnover_structure": _clamp(_number(row, "换手率", default=10) * 5),
+                    "acceleration_risk": 50}
+        return "三进四", round(score_three_to_four(features), 2)
+    features = {**common, "leader_identity": 60, "theme_core": 55,
+                "market_height": 60, "sector_ladder": 50}
+    return "高标接力", round(score_high_level(features), 2)
+
+
+def _candidate_evidence(row: pd.Series, peers: list[pd.Series], target_date: str) -> dict:
+    sector = str(_scalar(row, "所属行业", _scalar(row, "行业", "未知")))
+    code = str(_scalar(row, "代码", ""))
+    height = int(_number(row, "连板数", default=0))
+    def candidate(item: pd.Series) -> SameHeightCandidate:
+        return SameHeightCandidate(
+            name=str(_scalar(item, "名称", _scalar(item, "代码", "未知"))),
+            height=int(_number(item, "连板数", default=0)),
+            sector=str(_scalar(item, "所属行业", _scalar(item, "行业", "未知"))),
+            auction_score=_clamp(50 + _number(item, "竞价涨幅", default=0) * 5),
+            turnover_quality=_clamp(_number(item, "换手率", default=10) * 5),
+            limitup_quality=_clamp(70 - _number(item, "炸板次数", default=0) * 8),
+            sector_strength=_clamp(50 + _number(item, "涨停家数", default=0) * 5),
+            leader_identity=_clamp(50 + _number(item, "连板数", default=0) * 8),
+            tradability=_clamp(70 - _number(item, "炸板次数", default=0) * 7),
+        )
+    target = candidate(row)
+    competition = same_height_competition(target, [candidate(item) for item in peers])
+
+    observations = []
+    for item in peers:
+        if str(_scalar(item, "所属行业", _scalar(item, "行业", "未知"))) != sector:
+            continue
+        item_height = int(_number(item, "连板数", default=0))
+        if item_height < height:
+            continue
+        observations.append(LeaderObservation(
+            name=str(_scalar(item, "名称", _scalar(item, "代码", "未知"))),
+            height=item_height,
+            pct_chg=_number(item, "涨跌幅", "涨幅", default=0),
+            auction_gap=_number(item, "竞价涨幅", default=0),
+            final_sealed=_number(item, "炸板次数", default=0) == 0,
+            limit_down=_number(item, "涨跌幅", "涨幅", default=0) <= -9,
+            above_vwap_ratio=None,
+            is_sector_core=item_height >= height,
+        ))
+    feedback = sector_high_level_feedback(observations)
+    sector_count = len([item for item in peers if str(_scalar(item, "所属行业", _scalar(item, "行业", "未知"))) == sector])
+    ladder = _clamp(40 + sector_count * 12)
+    reflow = theme_reflow_evidence(
+        prior_heat=_clamp(45 + height * 10),
+        divergence_depth=_clamp(50 + _number(row, "炸板次数", default=0) * 5),
+        sector_flow_score=_clamp(50 + _number(row, "板块主力净流入", default=0)),
+        leader_feedback_score=feedback.score,
+        ladder_completeness=ladder,
+        breadth_recovery=_clamp(40 + sector_count * 10),
+        auction_core_strength=_clamp(50 + _number(row, "竞价涨幅", default=0) * 5),
+    )
+    return {
+        "板块地位": f"{sector}；同题材候选{sector_count}只；梯队完整度{ladder:.0f}",
+        "高标反馈分": feedback.score,
+        "高标反馈": feedback.detail,
+        "同身位卡位分": competition.score,
+        "同身位卡位": competition.detail,
+        "题材回流分": reflow.score,
+        "题材回流": reflow.detail,
+        "证据模块可用": any((feedback.available, competition.available, reflow.available)),
+    }
+
+
+def _narrative(row: pd.Series) -> tuple[str, str, str]:
+    positive: list[str] = []
+    negative: list[str] = []
+    if _number(row, "同身位卡位分", default=50) >= 65:
+        positive.append("同身位主动性/可交易性较强")
+    else:
+        negative.append("同身位竞争不占优")
+    if _number(row, "高标反馈分", default=50) >= 65:
+        positive.append("板块高标反馈偏正向")
+    elif _number(row, "高标反馈分", default=50) <= 38:
+        negative.append("板块高位核心存在明显负反馈")
+    if _number(row, "题材回流分", default=50) >= 65:
+        positive.append("题材具备回流条件")
+    if _number(row, "CYQ获利比例", default=50) >= 92:
+        negative.append("获利盘比例偏高，需防一致兑现")
+    if _number(row, "炸板次数", default=0) >= 2:
+        negative.append("炸板次数偏多")
+    flow = _scalar(row, "主力净流入占比")
+    if flow is not None and float(flow) > 0:
+        positive.append("个股资金流为正")
+    if not positive:
+        positive.append("保留原连板模型判断，新增证据不足")
+    if not negative:
+        negative.append("未发现已量化的主要反向证据，仍需观察竞价与量能")
+    next_day = "高开0~4%且量能匹配可视为符合预期；高开过高但量能不足需防一致兑现；平开后回到均价线上可作弱转强观察。"
+    return "；".join(positive), "；".join(negative), next_day
+
+
+def build_snapshot(date: str, enrich_top: int = 80, cyq_top: int = 30, provider: Any | None = None) -> pd.DataFrame:
+    router = provider if isinstance(provider, ProviderRouter) else ProviderRouter([provider or AKShareProvider()])
+    pool = _safe_call(router, "limit_up_pool", date)
     if pool.empty:
         return pool
-
     pool["代码"] = pool["代码"].astype(str).str.zfill(6)
+    quality: dict[str, str] = {}
 
-    try:
-        strong = provider.strong_pool(date).copy()
-        if not strong.empty:
-            strong["代码"] = strong["代码"].astype(str).str.zfill(6)
-            keep = [
-                c for c in ["代码", "入选理由", "是否新高", "量比"]
-                if c in strong.columns
-            ]
-            pool = pool.merge(
-                strong[keep].drop_duplicates("代码"),
-                on="代码", how="left",
-            )
-    except Exception:
-        pass
+    strong = _safe_call(router, "strong_pool", date)
+    if not strong.empty and "代码" in strong.columns:
+        strong["代码"] = strong["代码"].astype(str).str.zfill(6)
+        keep = [c for c in ["代码", "入选理由", "是否新高", "量比"] if c in strong.columns]
+        pool = pool.merge(strong[keep].drop_duplicates("代码"), on="代码", how="left")
+    quality["强势股池"] = router.quality.get("strong_pool", "unavailable")
 
-    try:
-        lhb = provider.dragon_tiger(date, date).copy()
-        if not lhb.empty:
-            lhb["代码"] = lhb["代码"].astype(str).str.zfill(6)
-            keep = [
-                c for c in [
-                    "代码", "龙虎榜净买额",
-                    "净买额占总成交比", "上榜原因",
-                ] if c in lhb.columns
-            ]
-            lhb = (
-                lhb[keep].sort_values("代码")
-                .drop_duplicates("代码", keep="last")
-            )
-            pool = pool.merge(lhb, on="代码", how="left")
-    except Exception:
-        pass
+    lhb = _safe_call(router, "dragon_tiger", date, date)
+    if not lhb.empty and "代码" in lhb.columns:
+        lhb["代码"] = lhb["代码"].astype(str).str.zfill(6)
+        keep = [c for c in ["代码", "龙虎榜净买额", "净买额占总成交比", "上榜原因"] if c in lhb.columns]
+        pool = pool.merge(lhb[keep].drop_duplicates("代码"), on="代码", how="left")
+    quality["龙虎榜"] = router.quality.get("dragon_tiger", "unavailable")
 
-    sort_cols = [
-        c for c in ["连板数", "封板资金", "成交额"] if c in pool.columns
-    ]
-    ranked = (
-        pool.sort_values(sort_cols, ascending=[False] * len(sort_cols))
-        if sort_cols else pool
-    )
-
-    flow_rows = {}
-    for code in ranked.head(max(0, enrich_top))["代码"].tolist():
-        flow_rows[code] = _latest_individual_flow(provider, code)
+    ranked = pool.sort_values([c for c in ["连板数", "封板资金", "成交额"] if c in pool.columns], ascending=False) if any(c in pool.columns for c in ["连板数", "封板资金", "成交额"]) else pool
+    flow_rows = {code: _latest_individual_flow(router, code, date) for code in ranked.head(max(0, enrich_top))["代码"].tolist()}
     flow_df = pd.DataFrame.from_dict(flow_rows, orient="index")
     if not flow_df.empty:
         flow_df.index.name = "代码"
         pool = pool.merge(flow_df.reset_index(), on="代码", how="left")
+    quality["资金流"] = "ok" if any(item.get("资金流可用") for item in flow_rows.values()) else "unavailable"
 
-    # True CYQ evidence replaces the old lightweight proxy for top candidates.
-    cyq_rows = {}
-    close_col = "最新价" if "最新价" in pool.columns else None
     ranked_now = pool.set_index("代码", drop=False)
+    cyq_rows = {}
     for code in ranked.head(max(0, cyq_top))["代码"].tolist():
-        close = (
-            _scalar(ranked_now.loc[code], close_col)
-            if close_col and code in ranked_now.index else None
-        )
-        cyq_rows[code] = _latest_cyq(provider, code, close)
+        close = _number(ranked_now.loc[code], "最新价", default=0) if code in ranked_now.index else 0
+        cyq_rows[code] = _latest_cyq(router, code, close, date)
     cyq_df = pd.DataFrame.from_dict(cyq_rows, orient="index")
     if not cyq_df.empty:
         cyq_df.index.name = "代码"
         pool = pool.merge(cyq_df.reset_index(), on="代码", how="left")
+    quality["CYQ"] = "ok" if any(item.get("CYQ可用") for item in cyq_rows.values()) else "unavailable"
 
-    if "连板数" in pool.columns:
-        pool["接力模式"] = pool["连板数"].map(
-            lambda h: (
-                "一进二观察" if h == 1 else
-                "二进三观察" if h == 2 else
-                "三进四观察" if h == 3 else
-                "高标接力观察"
-            )
-        )
-
-    def rationale(row):
-        parts = []
-        reason = _scalar(row, "入选理由")
-        if reason:
-            parts.append(f"强势池:{reason}")
-        main_flow = _scalar(row, "主力净流入占比")
-        if main_flow is not None:
-            parts.append(f"主力净流入占比:{float(main_flow):.2f}%")
-        lhb_ratio = _scalar(row, "净买额占总成交比")
-        if lhb_ratio is not None:
-            parts.append(f"龙虎榜净买占比:{float(lhb_ratio):.2f}%")
-        turnover = _scalar(row, "换手率")
-        if turnover is not None:
-            parts.append(f"换手:{float(turnover):.2f}%")
-        boards = _scalar(row, "炸板次数")
-        if boards is not None:
-            parts.append(f"炸板:{int(boards)}次")
-        cyq = _scalar(row, "CYQ论据")
-        if cyq:
-            parts.append(str(cyq))
-        return "；".join(parts) if parts else "维持原连板因子判断"
-
-    pool["新增论据"] = pool.apply(rationale, axis=1)
+    pool["接力模式"] = pool.get("连板数", pd.Series(index=pool.index, dtype=float)).map(lambda h: "一进二" if h == 1 else "二进三" if h == 2 else "三进四" if h == 3 else "高标接力")
+    base_values = pool.apply(lambda row: _base_score(row), axis=1)
+    pool["基础策略"] = [item[0] for item in base_values]
+    pool["base_strategy_score"] = [item[1] for item in base_values]
+    evidence_rows = []
+    for _, row in pool.iterrows():
+        peers = [item for _, item in pool.iterrows() if int(_number(item, "连板数", default=0)) == int(_number(row, "连板数", default=0))]
+        evidence_rows.append(_candidate_evidence(row, peers, date))
+    evidence_df = pd.DataFrame(evidence_rows, index=pool.index)
+    pool = pd.concat([pool, evidence_df], axis=1)
+    evidence_cols = ["高标反馈分", "同身位卡位分", "题材回流分"]
+    pool["evidence_shadow_score"] = pool[evidence_cols].mean(axis=1).round(2)
+    pool["final_score"] = pool["base_strategy_score"]
+    narratives = pool.apply(_narrative, axis=1, result_type="expand")
+    pool["正向证据"], pool["反向证据 / 风险"], pool["次日观察重点"] = narratives[0], narratives[1], narratives[2]
+    pool["新增论据"] = pool["正向证据"] + "；反向/风险：" + pool["反向证据 / 风险"]
+    pool["data_quality"] = [dict(quality, **router.quality_report()) for _ in range(len(pool))]
     return pool
 
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--date", required=True, help="YYYYMMDD")
-    p.add_argument("--enrich-top", type=int, default=80)
-    p.add_argument("--cyq-top", type=int, default=30)
-    p.add_argument("--output", default=None)
-    args = p.parse_args()
-
-    df = build_snapshot(args.date, args.enrich_top, args.cyq_top)
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Point-in-time limit-up evidence screen")
+    parser.add_argument("--date", required=True, help="Target trading date YYYYMMDD")
+    parser.add_argument("--enrich-top", type=int, default=80)
+    parser.add_argument("--cyq-top", type=int, default=30)
+    parser.add_argument("--output", default=None)
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
+    frame = build_snapshot(args.date, args.enrich_top, args.cyq_top)
     if args.output:
         out = Path(args.output)
         out.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(out, index=False, encoding="utf-8-sig")
+        frame.to_csv(out, index=False, encoding="utf-8-sig")
         print(out)
-    else:
-        preferred = [
-            c for c in [
-                "代码", "名称", "连板数", "接力模式",
-                "最新价", "换手率", "封板资金",
-                "首次封板时间", "最后封板时间", "炸板次数",
-                "所属行业", "入选理由", "主力净流入占比",
-                "净买额占总成交比", "CYQ影子分",
-                "CYQ论据", "新增论据",
-            ] if c in df.columns
-        ]
-        print(df[preferred].to_string(index=False))
+        return
+    preferred = [c for c in [
+        "代码", "名称", "连板数", "接力模式", "基础策略", "base_strategy_score",
+        "evidence_shadow_score", "final_score", "板块地位", "高标反馈", "同身位卡位",
+        "题材回流", "CYQ论据", "正向证据", "反向证据 / 风险", "次日观察重点",
+    ] if c in frame.columns]
+    print(frame[preferred].to_string(index=False))
 
 
 if __name__ == "__main__":
